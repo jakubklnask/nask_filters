@@ -4,133 +4,117 @@ from common.djangoapps.student.models import CourseEnrollment
 from openedx.core.djangoapps.content.course_overviews.models import CourseOverview
 from crum import get_current_user 
 
-
-# Ustawiamy logger
 log = logging.getLogger(__name__)
 
 class AutoEnrollByCorpEmail(PipelineStep):
     """
     Przy logowaniu sprawdza domenę emaila i zapisuje na wszystkie kursy tej organizacji.
-    Wersja z HEAVY DEBUGGING.
+    Wersja ZOPTYMALIZOWANA (brak problemu N+1 zapytań SQL).
     """
 
     def run_filter(self, user, *args, **kwargs):
-        log.info(f"[NASK-DEBUG] --- START AutoEnrollByCorpEmail ---")
-        log.info(f"[NASK-DEBUG] User: {user.username}, Email: {user.email}, IsActive: {user.is_active}")
-
+        # 0. Walidacja wstępna
         if not user.is_active:
-            log.info("[NASK-DEBUG] Użytkownik nieaktywny. Przerywam.")
             return {}
 
         # 1. Wyłuskanie "slugu" z maila
         try:
             if '@' not in user.email:
-                log.warning(f"[NASK-DEBUG] Błędny format emaila (brak @): {user.email}")
                 return {}
-                
-            email_domain = user.email.split('@')[1] # np. nokia.com
-            # UWAGA: Tutaj założenie, że nazwa firmy to pierwsza część domeny
-            org_slug = email_domain.split('.')[0]   # np. nokia
-            
-            log.info(f"[NASK-DEBUG] Parsowanie emaila: Domena='{email_domain}' -> OrgSlug='{org_slug}'")
+            email_domain = user.email.split('@')[1] 
+            # Zakładamy: domena 'nokia.com' -> organizacja 'nokia'
+            org_slug = email_domain.split('.')[0]   
         except Exception as e:
-            log.exception(f"[NASK-DEBUG] CRITICAL ERROR przy parsowaniu emaila: {e}")
+            log.warning(f"[NASK] Błąd parsowania maila {user.email}: {e}")
             return {}
 
-        # 2. Pobranie kursów z bazy danych
-        try:
-            log.info(f"[NASK-DEBUG] Szukam kursów dla org__iexact='{org_slug}' w modelu CourseOverview...")
-            
-            # Pobieramy tylko ID, żeby nie zapychać pamięci, jeśli kursów jest 1000
-            courses_to_enroll = CourseOverview.objects.filter(org__iexact=org_slug)
-            count = courses_to_enroll.count()
-            
-            log.info(f"[NASK-DEBUG] Znaleziono {count} kursów pasujących do organizacji '{org_slug}'.")
-            
-            if count == 0:
-                log.info("[NASK-DEBUG] Brak kursów. Kończę filtr.")
-                return {}
-
-        except Exception as e:
-            log.exception(f"[NASK-DEBUG] Błąd przy odpytywaniu bazy danych o kursy: {e}")
-            return {}
-
-        # 3. Zapisywanie użytkownika
-        enrolled_count = 0
-        already_enrolled_count = 0
-
-        for course in courses_to_enroll:
-            course_id_str = str(course.id)
-            try:
-                # Sprawdź czy już nie jest zapisany
-                is_enrolled = CourseEnrollment.is_enrolled(user, course.id)
-                
-                if is_enrolled:
-                    already_enrolled_count += 1
-                    # Odkomentuj linię niżej, jeśli chcesz widzieć każdy pominięty kurs (dużo logów)
-                    # log.info(f"[NASK-DEBUG] User {user.username} już zapisany na {course_id_str}. Pomijam.")
-                else:
-                    log.info(f"[NASK-DEBUG] PRÓBA zapisu użytkownika {user.username} na kurs {course_id_str}...")
-                    CourseEnrollment.enroll(
-                        user=user,
-                        course_key=course.id,
-                        mode="audit", # lub 'honor'
-                        check_access=True
-                    )
-                    log.info(f"[NASK-DEBUG] SUKCES: Zapisano na {course_id_str}")
-                    enrolled_count += 1
-
-            except Exception as e:
-                log.error(f"[NASK-DEBUG] BŁĄD przy zapisywaniu na kurs {course_id_str}: {e}")
-
-        log.info(f"[NASK-DEBUG] Podsumowanie: Nowych zapisów: {enrolled_count}, Było już zapisanych: {already_enrolled_count}")
-        log.info(f"[NASK-DEBUG] --- END AutoEnrollByCorpEmail ---")
+        # 2. Pobranie kursów organizacji
+        # Pobieramy tylko te kursy, które pasują do slug-a
+        courses_to_enroll = list(CourseOverview.objects.filter(org__iexact=org_slug))
         
-        return {}
+        if not courses_to_enroll:
+            # log.info(f"[NASK] Brak kursów dla organizacji: {org_slug}")
+            return {}
 
+        # 3. OPTYMALIZACJA: Pobieramy ID wszystkich aktywnych zapisów użytkownika JEDNYM zapytaniem.
+        # Tworzymy zbiór (set) ID kursów, co pozwala na błyskawiczne sprawdzanie "in set".
+        existing_enrollment_ids = set(
+            CourseEnrollment.objects.filter(
+                user=user, 
+                is_active=True
+            ).values_list('course_id', flat=True)
+        )
+
+        # 4. Pętla zapisu (sprawdzenie w RAM, zapis tylko gdy konieczne)
+        for course in courses_to_enroll:
+            if course.id in existing_enrollment_ids:
+                # Użytkownik już ma ten kurs - pomijamy bez pytania bazy
+                continue
+
+            try:
+                log.info(f"[NASK] Auto-zapisywanie {user.username} na {course.id}")
+                CourseEnrollment.enroll(
+                    user=user,
+                    course_key=course.id,
+                    mode="audit", # lub 'honor'
+                    check_access=True
+                )
+            except Exception as e:
+                log.error(f"[NASK] Błąd zapisu na {course.id}: {e}")
+
+        return {}
 
 
 class StampCoursesForDashboard(PipelineStep):
     """
     Modyfikuje dane kursu wysyłane do Dashboardu (MFE).
-    Zmienia 'mode' na 'corp-auto-enrolled' (POPRAWIONA WERSJA).
+    Logika:
+    1. Jeśli Admin/Staff -> ZAWSZE pokazuj (ustaw 'corp-auto-enrolled').
+    2. Jeśli zwykły user -> Pokazuj tylko jeśli organizacja kursu == organizacja maila.
     """
 
     def run_filter(self, course_key, serialized_enrollment, *args, **kwargs):
-        # 1. Pobieramy usera z aktualnego wątku (bo filtr go nie przekazuje w argumentach)
+        # 1. Pobieramy usera z aktualnego wątku (filtr nie przekazuje go w argumentach)
         user = get_current_user()
         
-        # Logowanie startowe - sprawdźmy czy filtr w ogóle ruszył
-        log.info(f"[NASK-DEBUG] [Stamp] Uruchomiono dla kursu: {course_key}")
-
         if not user or not user.is_authenticated:
-            log.warning("[NASK-DEBUG] [Stamp] Brak zalogowanego użytkownika.")
             return {}
 
-        # 2. Pobieramy organizację kursu z course_key (obiekt CourseKey)
+        # --- ADMIN PASS ---
+        # Jeśli użytkownik jest członkiem obsługi (is_staff) lub superuserem -> PRZEPUŚĆ WSZYSTKO
+        if user.is_staff or user.is_superuser:
+            # log.info(f"[NASK] Admin Access: Stempluję kurs {course_key} dla admina {user.username}")
+            serialized_enrollment['mode'] = 'corp-auto-enrolled'
+            return {
+                "course_key": course_key,
+                "serialized_enrollment": serialized_enrollment
+            }
+        # ------------------
+
+        # 2. Logika dla zwykłego użytkownika
+        
+        # Pobieranie organizacji kursu
         try:
             course_org = course_key.org.lower()
         except AttributeError:
-            # Fallback gdyby course_key był stringiem (rzadkie, ale możliwe)
+            # Fallback dla starszych wersji course_key
             course_org = str(course_key).split(':')[1].split('+')[0].lower()
 
-        # 3. Pobieramy organizację użytkownika z maila
+        # Pobieranie organizacji usera
         try:
             if not user.email or '@' not in user.email:
                 return {}
             user_org_slug = user.email.split('@')[1].split('.')[0].lower()
-        except Exception as e:
-            log.warning(f"[NASK-DEBUG] [Stamp] Błąd parsowania maila: {e}")
+        except Exception:
             return {}
 
-        # 4. Porównanie i Stemplowanie
+        # 3. Porównanie i Stemplowanie
         if course_org == user_org_slug:
-            log.info(f"[NASK-DEBUG] [Stamp] MATCH! Kurs {course_key} pasuje do organizacji {user_org_slug}. Zmieniam mode.")
+            # log.info(f"[NASK] MATCH! Kurs {course_key} pasuje do organizacji {user_org_slug}.")
             
-            # W tym filtrze edytujemy 'serialized_enrollment', który jest słownikiem
+            # Ustawiamy flagę uzgodnioną z Frontendem
             serialized_enrollment['mode'] = 'corp-auto-enrolled'
             
-            # Musimy zwrócić dokładnie te nazwy argumentów, które przyszły na wejście
             return {
                 "course_key": course_key,
                 "serialized_enrollment": serialized_enrollment
