@@ -1,0 +1,16 @@
+# pyproject.toml
+[build-system]
+requires = ["setuptools", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "my-custom-filters"
+version = "0.1.0"
+dependencies = [
+    "openedx-filters",
+]
+
+# --- THE IMPORTANT PART ---
+# This tells Open edX: "Load this app when the LMS starts"
+[project.entry-points."lms.djangoapp"]
+nask_filters = "nask_filters.apps:NaskFiltersConfig"
