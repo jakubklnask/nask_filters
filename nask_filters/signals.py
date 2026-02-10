@@ -15,7 +15,11 @@ def auto_enroll_on_creation(sender, instance, created, **kwargs):
     Ta funkcja uruchamia się AUTOMATYCZNIE za każdym razem, gdy zapisywany jest User.
     Parametr 'created' jest True tylko wtedy, gdy to NOWY użytkownik (rejestracja).
     """
-    if not created:
+    if not created or kwargs.get('raw'):
+        return
+
+    # zapobiega problemom przy launchowaniu platformy
+    if instance.username in ['ecommerce_worker', 'lms_worker', 'cms_worker']:
         return
 
     user = instance
