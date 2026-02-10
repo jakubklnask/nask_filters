@@ -22,6 +22,11 @@ def auto_enroll_on_creation(sender, instance, created, **kwargs):
     if instance.username in ['ecommerce_worker', 'lms_worker', 'cms_worker']:
         return
 
+    # Sprawdź czy tabela w ogóle istnieje (bezpiecznik migracyjny)
+    from django.db import connection
+    if 'course_overviews_courseoverview' not in connection.introspection.table_names():
+        return
+
     user = instance
     log.info(f"[NASK-SIGNAL] Wykryto utworzenie nowego użytkownika: {user.username}. Rozpoczynam auto-zapis.")
 
